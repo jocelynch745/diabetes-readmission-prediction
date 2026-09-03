@@ -1,0 +1,801 @@
+---
+title: "Predicting 30-Day Hospital Readmission for Patients with Diabetes"
+output: html_document
+date: "2026-04-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Preprocessing
+Step 1:Load packages and read data
+```{r}
+library(tidyverse)
+library(caret)
+
+# Read the main dataset
+diabetes <- read.csv("../data/diabetic_data.csv", stringsAsFactors = FALSE)
+
+# Read the mapping file
+ids_map <- read.csv("../data/IDS_mapping.csv", stringsAsFactors = FALSE)
+
+# Check data size
+dim(diabetes)
+
+# Preview data
+head(diabetes)
+```
+```{r}
+names(diabetes)
+```
+Step 2: Replace “?” with missing values
+```{r}
+# Replace "?" with NA
+diabetes[diabetes == "?"] <- NA
+
+# Check missing values by variable
+missing_summary <- data.frame(
+  variable = names(diabetes),
+  missing_count = colSums(is.na(diabetes)),
+  missing_percent = colSums(is.na(diabetes)) / nrow(diabetes) * 100
+)
+
+# Show variables with missing values
+missing_summary %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_percent))
+```
+
+Remove variables with too much missingness
+```{r}
+diabetes_clean <- diabetes %>%
+  select(
+    -weight,
+    -medical_specialty,
+    -payer_code
+  )
+
+# For the remaining categorical variables, replace missing values with "Unknown"
+diabetes_clean <- diabetes_clean %>%
+  mutate(across(where(is.character), ~replace_na(.x, "Unknown")))
+```
+
+Step 4: Create binary outcome variable
+```{r}
+# Create binary outcome variable
+# Yes = readmitted within 30 days
+# No  = not readmitted within 30 days or readmitted after 30 days
+
+diabetes_clean <- diabetes_clean %>%
+  mutate(
+    readmitted_30 = ifelse(readmitted == "<30", "Yes", "No"),
+    readmitted_30 = as.factor(readmitted_30)
+  )
+
+# Check the distribution of the new outcome variable
+table(diabetes_clean$readmitted_30)
+prop.table(table(diabetes_clean$readmitted_30))
+```
+Step 5: Remove ID variables and original outcome variable
+```{r}
+# Remove ID variables and the original outcome variable
+# encounter_id and patient_nbr are identifiers, not useful predictors.
+# readmitted is removed because we already created readmitted_30.
+
+diabetes_clean <- diabetes_clean %>%
+  select(
+    -encounter_id,
+    -patient_nbr,
+    -readmitted
+  )
+```
+
+Step 6: Convert ID-coded variables to factors
+```{r}
+# These variables are numerical codes, but they represent categories.
+# Therefore, we convert them to factors.
+
+diabetes_clean <- diabetes_clean %>%
+  mutate(
+    admission_type_id = as.factor(admission_type_id),
+    discharge_disposition_id = as.factor(discharge_disposition_id),
+    admission_source_id = as.factor(admission_source_id)
+  )
+```
+
+Step 7: Convert all character variables to factors
+```{r}
+# Convert all remaining character variables to factors
+# This is needed for classification models and logistic regression.
+
+diabetes_clean <- diabetes_clean %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+
+Step 8: Group diagnosis codes
+```{r}
+# Function to group ICD diagnosis codes into broader disease categories
+
+group_diag <- function(x) {
+  
+  x <- as.character(x)
+  x[is.na(x)] <- "Unknown"
+  
+  # Some diagnosis codes start with letters, such as E or V.
+  # We keep them as Other.
+  x_num <- suppressWarnings(as.numeric(x))
+  
+  result <- case_when(
+    x == "Unknown" ~ "Unknown",
+    
+    # Diabetes
+    str_detect(x, "^250") ~ "Diabetes",
+    
+    # Circulatory system
+    !is.na(x_num) & x_num >= 390 & x_num <= 459 ~ "Circulatory",
+    x == "785" ~ "Circulatory",
+    
+    # Respiratory system
+    !is.na(x_num) & x_num >= 460 & x_num <= 519 ~ "Respiratory",
+    x == "786" ~ "Respiratory",
+    
+    # Digestive system
+    !is.na(x_num) & x_num >= 520 & x_num <= 579 ~ "Digestive",
+    x == "787" ~ "Digestive",
+    
+    # Injury
+    !is.na(x_num) & x_num >= 800 & x_num <= 999 ~ "Injury",
+    
+    # Musculoskeletal system
+    !is.na(x_num) & x_num >= 710 & x_num <= 739 ~ "Musculoskeletal",
+    
+    # Genitourinary system
+    !is.na(x_num) & x_num >= 580 & x_num <= 629 ~ "Genitourinary",
+    x == "788" ~ "Genitourinary",
+    
+    TRUE ~ "Other"
+  )
+  
+  return(as.factor(result))
+}
+
+# Apply the grouping function to the three diagnosis variables
+
+diabetes_clean <- diabetes_clean %>%
+  mutate(
+    diag_1_group = group_diag(diag_1),
+    diag_2_group = group_diag(diag_2),
+    diag_3_group = group_diag(diag_3)
+  ) %>%
+  select(
+    -diag_1,
+    -diag_2,
+    -diag_3
+  )
+
+# Check the new diagnosis groups
+table(diabetes_clean$diag_1_group)
+table(diabetes_clean$diag_2_group)
+table(diabetes_clean$diag_3_group)
+
+```
+Step 9: Check remaining missing values
+```{r}
+# Check if there are any remaining missing values
+
+sum(is.na(diabetes_clean))
+
+# Missing values by variable
+colSums(is.na(diabetes_clean))[colSums(is.na(diabetes_clean)) > 0]
+```
+
+EDA
+
+Outcome distribution
+```{r}
+# Outcome distribution
+table(diabetes_clean$readmitted_30)
+
+prop.table(table(diabetes_clean$readmitted_30))
+
+library(ggplot2)
+
+ggplot(diabetes_clean, aes(x = readmitted_30)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of 30-Day Readmission",
+    x = "Readmitted within 30 days",
+    y = "Count"
+  )
+```
+
+
+EDA 2: Age distribution by readmission status
+```{r}
+ggplot(diabetes_clean, aes(x = age, fill = readmitted_30)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "30-Day Readmission Rate by Age Group",
+    x = "Age Group",
+    y = "Proportion",
+    fill = "Readmitted within 30 Days"
+  )
+```
+
+
+EDA 3: Prior inpatient visits and readmission
+```{r}
+ggplot(diabetes_clean, aes(x = factor(number_inpatient), fill = readmitted_30)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "30-Day Readmission Rate by Prior Inpatient Visits",
+    x = "Number of Prior Inpatient Visits",
+    y = "Proportion",
+    fill = "Readmitted within 30 Days"
+  )
+```
+
+EDA 4: Diagnosis group and readmission
+
+```{r}
+ggplot(diabetes_clean, aes(x = diag_1_group, fill = readmitted_30)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "30-Day Readmission Rate by Primary Diagnosis Group",
+    x = "Primary Diagnosis Group",
+    y = "Proportion",
+    fill = "Readmitted within 30 Days"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+Modeling
+
+Train/test split
+```{r}
+library(caret)
+
+# Make sure outcome is a factor
+diabetes_clean$readmitted_30 <- factor(
+  diabetes_clean$readmitted_30,
+  levels = c("No", "Yes")
+)
+
+set.seed(123)
+
+# 80/20 split
+train_index <- createDataPartition(
+  diabetes_clean$readmitted_30,
+  p = 0.8,
+  list = FALSE
+)
+
+train_data <- diabetes_clean[train_index, ]
+test_data  <- diabetes_clean[-train_index, ]
+
+# Drop unused factor levels
+train_data <- droplevels(train_data)
+test_data  <- droplevels(test_data)
+
+# Check split size
+dim(train_data)
+dim(test_data)
+
+# Check outcome distribution
+prop.table(table(train_data$readmitted_30))
+prop.table(table(test_data$readmitted_30))
+```
+
+```{r}
+# Find factor variables with only one level in training data
+
+one_level_vars <- names(train_data)[sapply(train_data, function(x) {
+  is.factor(x) && nlevels(x) < 2
+})]
+
+one_level_vars
+
+train_data_logit <- train_data %>%
+  select(-all_of(one_level_vars))
+
+test_data_logit <- test_data %>%
+  select(-all_of(one_level_vars))
+
+# Check again
+
+names(train_data_logit)[sapply(train_data_logit, function(x) {
+  is.factor(x) && nlevels(x) < 2
+})]
+```
+
+
+```{r}
+# Find factor variables that have levels in test data but not in training data
+
+factor_vars <- names(train_data_logit)[sapply(train_data_logit, is.factor)]
+
+new_level_vars <- c()
+
+for (v in factor_vars) {
+  train_levels <- levels(train_data_logit[[v]])
+  test_levels  <- levels(test_data_logit[[v]])
+  
+  new_levels <- setdiff(test_levels, train_levels)
+  
+  if (length(new_levels) > 0) {
+    cat("Variable:", v, "has new levels in test:", new_levels, "\n")
+    new_level_vars <- c(new_level_vars, v)
+  }
+}
+
+new_level_vars
+
+# Remove variables that have unseen levels in the test set
+
+train_data_logit <- train_data_logit %>%
+  select(-all_of(new_level_vars))
+
+test_data_logit <- test_data_logit %>%
+  select(-all_of(new_level_vars))
+```
+
+Logistic Regression
+```{r}
+# Fit baseline logistic regression model
+
+logit_model <- glm(
+  readmitted_30 ~ .,
+  data = train_data_logit,
+  family = binomial
+)
+
+# Check model summary
+summary(logit_model)
+```
+
+
+(a)Predict probabilities on test data
+```{r}
+# Predict probability of 30-day readmission on the test set
+
+logit_prob <- predict(
+  logit_model,
+  newdata = test_data_logit,
+  type = "response"
+)
+
+# Check first few predicted probabilities
+head(logit_prob)
+summary(logit_prob)
+```
+(b)confusion matrix
+```{r}
+library(caret)
+
+# Convert probabilities to class labels using threshold = 0.5
+
+logit_pred <- ifelse(logit_prob > 0.5, "Yes", "No")
+logit_pred <- factor(logit_pred, levels = c("No", "Yes"))
+
+# Confusion matrix
+
+logit_cm <- confusionMatrix(
+  data = logit_pred,
+  reference = test_data_logit$readmitted_30,
+  positive = "Yes"
+)
+
+logit_cm
+```
+```{r}
+# Try threshold = 0.3
+
+logit_pred_03 <- ifelse(logit_prob > 0.3, "Yes", "No")
+logit_pred_03 <- factor(logit_pred_03, levels = c("No", "Yes"))
+
+logit_cm_03 <- confusionMatrix(
+  data = logit_pred_03,
+  reference = test_data_logit$readmitted_30,
+  positive = "Yes"
+)
+
+logit_cm_03
+```
+```{r}
+# Try threshold = 0.2
+
+logit_pred_02 <- ifelse(logit_prob > 0.2, "Yes", "No")
+logit_pred_02 <- factor(logit_pred_02, levels = c("No", "Yes"))
+
+logit_cm_02 <- confusionMatrix(
+  data = logit_pred_02,
+  reference = test_data_logit$readmitted_30,
+  positive = "Yes"
+)
+
+logit_cm_02
+```
+
+(c)AUC and ROC curve
+```{r}
+library(pROC)
+
+logit_roc <- roc(
+  response = test_data_logit$readmitted_30,
+  predictor = logit_prob,
+  levels = c("No", "Yes")
+)
+
+logit_auc <- auc(logit_roc)
+logit_auc
+
+plot(
+  logit_roc,
+  main = "ROC Curve for Baseline Logistic Regression"
+)
+```
+
+```{r}
+threshold_results <- data.frame(
+  Threshold = c(0.5, 0.3, 0.2),
+  Accuracy = c(
+    logit_cm$overall["Accuracy"],
+    logit_cm_03$overall["Accuracy"],
+    logit_cm_02$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    logit_cm$byClass["Sensitivity"],
+    logit_cm_03$byClass["Sensitivity"],
+    logit_cm_02$byClass["Sensitivity"]
+  ),
+  Specificity = c(
+    logit_cm$byClass["Specificity"],
+    logit_cm_03$byClass["Specificity"],
+    logit_cm_02$byClass["Specificity"]
+  ),
+  Balanced_Accuracy = c(
+    logit_cm$byClass["Balanced Accuracy"],
+    logit_cm_03$byClass["Balanced Accuracy"],
+    logit_cm_02$byClass["Balanced Accuracy"]
+  ),
+  AUC = c(
+    as.numeric(logit_auc),
+    as.numeric(logit_auc),
+    as.numeric(logit_auc)
+  )
+)
+
+threshold_results
+```
+
+Classification Tree
+```{r}
+# Rename the cleaned train/test datasets to avoid confusion
+# they have already been cleaned and can be reused for later models
+train_model_data <- train_data_logit
+test_model_data  <- test_data_logit
+```
+
+```{r}
+library(tree)
+
+# create classification tree
+set.seed(123)
+
+tree_model <- tree(
+  readmitted_30 ~ .,
+  data = train_model_data
+)
+```
+```{r}
+# plot tree
+plot(tree_model)
+text(tree_model, pretty = 0, cex = 0.5)
+```
+
+```{r}
+# predict test set 
+tree_prob <- predict(tree_model, newdata = test_model_data, type = "vector")[, "Yes"]
+
+head(tree_prob)
+summary(tree_prob)
+```
+```{r}
+# try threshold = 0.5
+tree_pred <- ifelse(tree_prob > 0.5, "Yes", "No")
+tree_pred <- factor(tree_pred, levels = c("No", "Yes"))
+
+tree_cm <- confusionMatrix(
+  data = tree_pred,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+tree_cm
+```
+```{r}
+# try threshold = 0.3
+tree_pred_03 <- ifelse(tree_prob > 0.3, "Yes", "No")
+tree_pred_03 <- factor(tree_pred_03, levels = c("No", "Yes"))
+
+tree_cm_03 <- confusionMatrix(
+  data = tree_pred_03,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+tree_cm_03
+```
+```{r}
+# try threshold = 0.2
+tree_pred_02 <- ifelse(tree_prob > 0.2, "Yes", "No")
+tree_pred_02 <- factor(tree_pred_02, levels = c("No", "Yes"))
+
+tree_cm_02 <- confusionMatrix(
+  data = tree_pred_02,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+tree_cm_02
+```
+
+```{r}
+# ROC & AUC
+tree_roc <- roc(
+  response = test_model_data$readmitted_30,
+  predictor = tree_prob,
+  levels = c("No", "Yes")
+)
+
+tree_auc <- auc(tree_roc)
+tree_auc
+
+plot(tree_roc, main = "ROC Curve for Classification Tree")
+```
+
+```{r}
+# results
+tree_results <- data.frame(
+  Threshold = c(0.5, 0.3, 0.2),
+  Accuracy = c(
+    tree_cm$overall["Accuracy"],
+    tree_cm_03$overall["Accuracy"],
+    tree_cm_02$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    tree_cm$byClass["Sensitivity"],
+    tree_cm_03$byClass["Sensitivity"],
+    tree_cm_02$byClass["Sensitivity"]
+  ),
+  Specificity = c(
+    tree_cm$byClass["Specificity"],
+    tree_cm_03$byClass["Specificity"],
+    tree_cm_02$byClass["Specificity"]
+  ),
+  Balanced_Accuracy = c(
+    tree_cm$byClass["Balanced Accuracy"],
+    tree_cm_03$byClass["Balanced Accuracy"],
+    tree_cm_02$byClass["Balanced Accuracy"]
+  ),
+  AUC = c(
+    as.numeric(tree_auc),
+    as.numeric(tree_auc),
+    as.numeric(tree_auc)
+  )
+)
+
+tree_results
+```
+
+Random Forest
+```{r}
+library(randomForest)
+
+train_model_data <- train_data_logit
+test_model_data  <- test_data_logit
+
+# Force factor levels in test data to match training data
+for (v in names(train_model_data)) {
+  if (is.factor(train_model_data[[v]])) {
+    test_model_data[[v]] <- factor(
+      test_model_data[[v]],
+      levels = levels(train_model_data[[v]])
+    )
+  }
+}
+
+# create random forest
+set.seed(123)
+
+rf_model <- randomForest(
+  readmitted_30 ~ .,
+  data = train_model_data,
+  ntree = 300,
+  importance = TRUE
+)
+
+rf_model
+
+# variable importance
+importance(rf_model)
+varImpPlot(rf_model, cex = 0.5)
+```
+
+```{r}
+# predict prob on test set 
+rf_prob <- predict(rf_model, newdata = test_model_data, type = "prob")[, "Yes"]
+
+head(rf_prob)
+summary(rf_prob)
+```
+```{r}
+# try threshold = 0.5
+rf_pred <- ifelse(rf_prob > 0.5, "Yes", "No")
+rf_pred <- factor(rf_pred, levels = c("No", "Yes"))
+
+rf_cm <- confusionMatrix(
+  data = rf_pred,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+rf_cm
+```
+```{r}
+# try threshold = 0.3
+rf_pred_03 <- ifelse(rf_prob > 0.3, "Yes", "No")
+rf_pred_03 <- factor(rf_pred_03, levels = c("No", "Yes"))
+
+rf_cm_03 <- confusionMatrix(
+  data = rf_pred_03,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+rf_cm_03
+```
+```{r}
+# try threshold = 0.2
+rf_pred_02 <- ifelse(rf_prob > 0.2, "Yes", "No")
+rf_pred_02 <- factor(rf_pred_02, levels = c("No", "Yes"))
+
+rf_cm_02 <- confusionMatrix(
+  data = rf_pred_02,
+  reference = test_model_data$readmitted_30,
+  positive = "Yes"
+)
+
+rf_cm_02
+```
+
+```{r}
+# ROC & AUC
+rf_roc <- roc(
+  response = test_model_data$readmitted_30,
+  predictor = rf_prob,
+  levels = c("No", "Yes")
+)
+
+rf_auc <- auc(rf_roc)
+rf_auc
+
+# plot
+plot(rf_roc, main = "ROC Curve for Random Forest")
+```
+
+```{r}
+# results
+rf_results <- data.frame(
+  Threshold = c(0.5, 0.3, 0.2),
+  Accuracy = c(
+    rf_cm$overall["Accuracy"],
+    rf_cm_03$overall["Accuracy"],
+    rf_cm_02$overall["Accuracy"]
+  ),
+  Sensitivity = c(
+    rf_cm$byClass["Sensitivity"],
+    rf_cm_03$byClass["Sensitivity"],
+    rf_cm_02$byClass["Sensitivity"]
+  ),
+  Specificity = c(
+    rf_cm$byClass["Specificity"],
+    rf_cm_03$byClass["Specificity"],
+    rf_cm_02$byClass["Specificity"]
+  ),
+  Balanced_Accuracy = c(
+    rf_cm$byClass["Balanced Accuracy"],
+    rf_cm_03$byClass["Balanced Accuracy"],
+    rf_cm_02$byClass["Balanced Accuracy"]
+  ),
+  AUC = c(
+    as.numeric(rf_auc),
+    as.numeric(rf_auc),
+    as.numeric(rf_auc)
+  )
+)
+
+rf_results
+```
+
+Final Comparison
+```{r}
+model_com <- data.frame(
+  Model = c("Logistic Regression", "Classification Tree", "Random Forest"),
+  
+  Accuracy_0.5 = c(
+    logit_cm$overall["Accuracy"],
+    tree_cm$overall["Accuracy"],
+    rf_cm$overall["Accuracy"]
+  ),
+  Sensitivity_0.5 = c(
+    logit_cm$byClass["Sensitivity"],
+    tree_cm$byClass["Sensitivity"],
+    rf_cm$byClass["Sensitivity"]
+  ),
+  Specificity_0.5 = c(
+    logit_cm$byClass["Specificity"],
+    tree_cm$byClass["Specificity"],
+    rf_cm$byClass["Specificity"]
+  ),
+  Balanced_Accuracy_0.5 = c(
+    logit_cm$byClass["Balanced Accuracy"],
+    tree_cm$byClass["Balanced Accuracy"],
+    rf_cm$byClass["Balanced Accuracy"]
+  ),
+  
+  Accuracy_0.3 = c(
+    logit_cm_03$overall["Accuracy"],
+    tree_cm_03$overall["Accuracy"],
+    rf_cm_03$overall["Accuracy"]
+  ),
+  Sensitivity_0.3 = c(
+    logit_cm_03$byClass["Sensitivity"],
+    tree_cm_03$byClass["Sensitivity"],
+    rf_cm_03$byClass["Sensitivity"]
+  ),
+  Specificity_0.3 = c(
+    logit_cm_03$byClass["Specificity"],
+    tree_cm_03$byClass["Specificity"],
+    rf_cm_03$byClass["Specificity"]
+  ),
+  Balanced_Accuracy_0.3 = c(
+    logit_cm_03$byClass["Balanced Accuracy"],
+    tree_cm_03$byClass["Balanced Accuracy"],
+    rf_cm_03$byClass["Balanced Accuracy"]
+  ),
+  
+  Accuracy_0.2 = c(
+    logit_cm_02$overall["Accuracy"],
+    tree_cm_02$overall["Accuracy"],
+    rf_cm_02$overall["Accuracy"]
+  ),
+  Sensitivity_0.2 = c(
+    logit_cm_02$byClass["Sensitivity"],
+    tree_cm_02$byClass["Sensitivity"],
+    rf_cm_02$byClass["Sensitivity"]
+  ),
+  Specificity_0.2 = c(
+    logit_cm_02$byClass["Specificity"],
+    tree_cm_02$byClass["Specificity"],
+    rf_cm_02$byClass["Specificity"]
+  ),
+  Balanced_Accuracy_0.2 = c(
+    logit_cm_02$byClass["Balanced Accuracy"],
+    tree_cm_02$byClass["Balanced Accuracy"],
+    rf_cm_02$byClass["Balanced Accuracy"]
+  ),
+  
+  AUC = c(
+    as.numeric(logit_auc),
+    as.numeric(tree_auc),
+    as.numeric(rf_auc)
+  )
+)
+
+model_com
+```
